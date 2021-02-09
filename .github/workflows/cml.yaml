@@ -1,83 +1,109 @@
-name: style-transfer
-
-on: [push]
+on:
+  workflow_dispatch:
+  push:
+    branches: "*"
+  pull_request:
+    branches: "*"
 
 jobs:
-  deploy-cloud-runner:
-    runs-on: [ubuntu-latest]
-    container: docker://dvcorg/cml
+    execute:
+        runs-on: [ubuntu-latest]
+        steps:
+          - name: Execute runner
+            shell: bash
+            env:
+              GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+              KUBERNETES_CONFIGURATION: ${{ secrets.KUBERNETES_CONFIGURATION }}
+              GITHUB_TOKEN: ${{ secrets.REPOSITORY_SECRET }}
+            run: |
+              # Configure the Google Cloud service account; only required for Google Kubernetes Engine users.
+              export GOOGLE_APPLICATION_CREDENTIALS="$(realpath service-account-key.json)"
+              echo "$GOOGLE_SERVICE_ACCOUNT" > "$GOOGLE_APPLICATION_CREDENTIALS"
+              
+              # Alias the kubectl command so it reads the configuration from an environment variable.
+              shopt -s expand_aliases && alias kubectl='kubectl --kubeconfig <(echo "$KUBERNETES_CONFIGURATION")'
+              
+              # Declare a separate namespace for the jobs.
+              kubectl apply --filename - <<-END
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: cml
+              END
 
-    steps:
-      - name: deploy
-        env:
-          repo_token: ${{ secrets.REPO_TOKEN }} 
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        run: |
-          echo "Deploying..."
-          RUNNER_LABELS="cml,aws"
-          RUNNER_REPO="https://github.com/iterative/cml_cloud_case"
-          MACHINE="cml$(date +%s)"
-          
-          (
-          docker-machine create \
-            --driver amazonec2 \
-            --amazonec2-instance-type g3s.xlarge \
-            --amazonec2-vpc-id vpc-76f1f01e \
-            --amazonec2-region us-east-2 \
-            --amazonec2-zone b \
-            --amazonec2-ssh-user ubuntu \
-            --amazonec2-ami ami-07b11e59bc74961b5 \
-            --amazonec2-root-size 64 \
-            $MACHINE && \
+              # Launch a one-time job with the CML container image to perform all the heavy lifting on Kubernetes.
+              kubectl --namespace=cml apply --filename - <<-END
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: "cml-$GITHUB_SHA"
+                  namespace: cml
+                spec:
+                  template:
+                    spec:
+                      containers:
+                      - name: "cml-$GITHUB_SHA"
+                        image: dvcorg/cml-py3
+                        env:
+                        - name: GITHUB_TOKEN
+                          value: "$GITHUB_TOKEN"
+                        - name: RUNNER_REPO
+                          value: "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" 
+                      restartPolicy: Never
+              END
+                
+              # Wait (one week at most) for the job to complete or fail.
+              kubectl --namespace=cml wait --timeout=-1s --for=condition=complete "job/cml-$GITHUB_SHA" & complete=$!
+              kubectl --namespace=cml wait --timeout=-1s --for=condition=failed "job/cml-$GITHUB_SHA" & failed=$!
+              wait -n $complete $failed
+              
+              # Print the execution logs for the job.
+              kubectl --namespace=cml logs "job/cml-$GITHUB_SHA"
+              
+              # Delete the job, as it shouldn't be needed anymore.
+              #kubectl --namespace=cml delete "job/cml-$GITHUB_SHA"
+              
+              # Exit cleanly if the job didn't fail nor timeout.
+              #kill -0 $complete &>/dev/null &&
+              #! kill -0 $failed &>/dev/null
 
-          eval "$(docker-machine env --shell sh $MACHINE)" && \
-        
-          docker-machine ssh $MACHINE "sudo mkdir -p /docker_machine && sudo chmod 777 /docker_machine" && \
-          docker-machine scp -r -q ~/.docker/machine/ $MACHINE:/docker_machine && \
-          docker run --name runner --gpus all -d \
-            -v /docker_machine/machine:/root/.docker/machine \
-            -e DOCKER_MACHINE=$MACHINE \
-            -e repo_token=$repo_token \
-            -e RUNNER_LABELS=$RUNNER_LABELS \
-            -e RUNNER_REPO=$RUNNER_REPO \
-            -e RUNNER_IDLE_TIMEOUT=120 \
-            dvcorg/cml-py3:latest && \
-          sleep 20 && echo "Deployed $MACHINE"
-          ) || (docker-machine rm -y -f $MACHINE && exit 1)
-  train:
-    needs: deploy-cloud-runner
-    runs-on: [self-hosted,cml]
-    
-    steps:
-      - uses: actions/checkout@v2
 
-      - name: cml_run
-        env:
-          repo_token: ${{ secrets.REPO_TOKEN}}
-        run: |
-          apt-get update -y
-          apt-get install python3-dev -y
-          apt install imagemagick -y
-          pip install -r requirements.txt
-          
-          # DVC stuff
-          git fetch --prune
-          dvc repro
-          
-          echo "# Style transfer" >> report.md
-          git show origin/master:final_owl.png > master_owl.png
-          convert +append final_owl.png master_owl.png out.png
-          convert out.png -resize 75%  out_shrink.png
-          echo "### Workspace vs. Master" >> report.md
-          cml-publish out_shrink.png --md --title 'compare' >> report.md
-          
-          echo "## Training metrics" >> report.md
-          dvc params diff master --show-md >> report.md
-          
-          echo >> report.md
-          echo "## GPU info" >> report.md
-          cat gpu_info.txt >> report.md
-          
-          cml-send-comment report.md 
+    train:
+        needs: execute
+        runs-on: [self-hosted, cml]
+        steps:
+          - uses: actions/checkout@v2
+          - name: Run job
+            env:
+              GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+            run: |
+              apt-get update -y
+              apt-get install python3-dev -y
+              apt install imagemagick -y
+              pip install -r requirements.txt
+
+              # DVC reproduce neural style transfer training
+              dvc repro
+
+              # Compare master and workspace image results
+              git fetch --prune
+              git show origin/master:final_owl.png > master_owl.png
+              convert +append final_owl.png master_owl.png out.png
+              convert out.png -resize 75%  out_shrink.png
+              echo "# Style transfer" >> report.md
+              echo "### Workspace vs. Master" >> report.md
+              cml-publish out_shrink.png --md >> report.md
+
+              # Report training parameters
+              echo "## Training parameter diffs" >> report.md
+              dvc params diff master --show-md >> report.md
+
+              # Report GPU details
+              echo "## GPU info" >> report.md
+              cat gpu_info.txt >> report.md
+
+              cml-send-comment report.md
+
+
+
+
