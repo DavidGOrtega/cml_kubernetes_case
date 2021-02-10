@@ -6,10 +6,10 @@ on:
     branches: "*"
 
 jobs:
-    execute:
+    launch:
         runs-on: [ubuntu-latest]
         steps:
-          - name: Execute runner
+          - name: Launch runner
             shell: bash
             env:
               GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
@@ -19,10 +19,10 @@ jobs:
               # Configure the Google Cloud service account; only required for Google Kubernetes Engine users.
               export GOOGLE_APPLICATION_CREDENTIALS="$(realpath service-account-key.json)"
               echo "$GOOGLE_SERVICE_ACCOUNT" > "$GOOGLE_APPLICATION_CREDENTIALS"
-              
+
               # Alias the kubectl command so it reads the configuration from an environment variable.
               shopt -s expand_aliases && alias kubectl='kubectl --kubeconfig <(echo "$KUBERNETES_CONFIGURATION")'
-              
+
               # Declare a separate namespace for the jobs.
               kubectl apply --filename - <<-END
                 apiVersion: v1
@@ -39,6 +39,7 @@ jobs:
                   name: "cml-$GITHUB_SHA"
                   namespace: cml
                 spec:
+                  ttlSecondsAfterFinished: 120
                   template:
                     spec:
                       containers:
@@ -48,28 +49,33 @@ jobs:
                         - name: GITHUB_TOKEN
                           value: "$GITHUB_TOKEN"
                         - name: RUNNER_REPO
-                          value: "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" 
+                          value: "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+                        resources:
+                          limits:
+                            nvidia.com/gpu: 1
                       restartPolicy: Never
               END
-                
-              # Wait (one week at most) for the job to complete or fail.
-              kubectl --namespace=cml wait --timeout=-1s --for=condition=complete "job/cml-$GITHUB_SHA" & complete=$!
-              kubectl --namespace=cml wait --timeout=-1s --for=condition=failed "job/cml-$GITHUB_SHA" & failed=$!
-              wait -n $complete $failed
-              
-              # Print the execution logs for the job.
-              kubectl --namespace=cml logs "job/cml-$GITHUB_SHA"
-              
-              # Delete the job, as it shouldn't be needed anymore.
-              #kubectl --namespace=cml delete "job/cml-$GITHUB_SHA"
-              
+
+              # Wait (one week at most) for the runner job to be ready.
+              POD_NAME="$(kubectl get pods --namespace=cml --selector job-name="cml-$GITHUB_SHA" \
+                 --output=jsonpath="{.items[*].metadata.name}")"
+
+
+              # Wait (one week at most) for the pod to complete or fail.
+              kubectl --namespace=cml wait --timeout=-1s --for=condition=ready "pod/$POD_NAME" & ready=$!
+              kubectl --namespace=cml wait --timeout=-1s --for=condition=failed "pod/$POD_NAME" & failed=$!
+              wait -n $ready $failed
+
+              # Print the execution logs for the pod.
+              kubectl --namespace=cml logs "pod/$POD_NAME"
+
               # Exit cleanly if the job didn't fail nor timeout.
-              #kill -0 $complete &>/dev/null &&
-              #! kill -0 $failed &>/dev/null
+              kill -0 $ready &>/dev/null &&
+              ! kill -0 $failed &>/dev/null
 
 
     train:
-        needs: execute
+        needs: launch
         runs-on: [self-hosted, cml]
         steps:
           - uses: actions/checkout@v2
@@ -104,6 +110,32 @@ jobs:
 
               cml-send-comment report.md
 
+    cleanup:
+        needs: train
+        runs-on: [ubuntu-latest]
+        steps:
+          - name: Cleanup runner
+            shell: bash
+            env:
+              GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+              KUBERNETES_CONFIGURATION: ${{ secrets.KUBERNETES_CONFIGURATION }}
+              GITHUB_TOKEN: ${{ secrets.REPOSITORY_SECRET }}
+            run: |
+              # Configure the Google Cloud service account; only required for Google Kubernetes Engine users.
+              export GOOGLE_APPLICATION_CREDENTIALS="$(realpath service-account-key.json)"
+              echo "$GOOGLE_SERVICE_ACCOUNT" > "$GOOGLE_APPLICATION_CREDENTIALS"
 
+              # Alias the kubectl command so it reads the configuration from an environment variable.
+              shopt -s expand_aliases && alias kubectl='kubectl --kubeconfig <(echo "$KUBERNETES_CONFIGURATION")'
 
+              # Wait (one week at most) for the job to complete or fail.
+              kubectl --namespace=cml wait --timeout=-1s --for=condition=complete "job/cml-$GITHUB_SHA" & complete=$!
+              kubectl --namespace=cml wait --timeout=-1s --for=condition=failed "job/cml-$GITHUB_SHA" & failed=$!
+              wait -n $complete $failed
 
+              # Print the execution logs for the job.
+              kubectl --namespace=cml logs "job/cml-$GITHUB_SHA"
+
+              # Exit cleanly if the job didn't fail nor timeout.
+              kill -0 $complete &>/dev/null &&
+              ! kill -0 $failed &>/dev/null
